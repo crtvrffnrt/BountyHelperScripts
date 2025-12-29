@@ -4,6 +4,7 @@ import csv
 import json
 import os
 import ssl
+import subprocess
 import sys
 import time
 import urllib.error
@@ -52,6 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", dest="out_file", default="", help="Write JSON/CSV to this file.")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
     parser.add_argument("--deadcheck", action="store_true", help="Check HTTP/HTTPS liveness.")
+    parser.add_argument(
+        "--onlydead",
+        action="store_true",
+        help="Only output dead endpoints and check Traffic Manager registerability.",
+    )
     parser.add_argument("-h", "--help", action="store_true", dest="help_flag", help="Show this help and exit.")
     return parser
 
@@ -138,6 +144,11 @@ def redact_url(url: str) -> str:
     )
 
 
+def shodan_api_info(api_key: str, debug: bool) -> tuple[str, int]:
+    url = f"https://api.shodan.io/api-info?key={api_key}"
+    return shodan_get(url, debug)
+
+
 def shodan_get(url: str, debug: bool) -> tuple[str, int]:
     attempt = 0
     max_attempts = 5
@@ -153,7 +164,7 @@ def shodan_get(url: str, debug: bool) -> tuple[str, int]:
             status = exc.code
             body = exc.read().decode("utf-8", errors="replace")
         except Exception:
-            log_err(f"Request failed: {redact_url(url)}", debug)
+            log_dbg(f"Request failed: {redact_url(url)}", debug)
             return ("", 0)
 
         if status == 200:
@@ -166,10 +177,10 @@ def shodan_get(url: str, debug: bool) -> tuple[str, int]:
             delay *= 2
             continue
 
-        log_err(f"Shodan API error ({status}): {redact_url(url)}", debug)
+        log_dbg(f"Shodan API error ({status}): {redact_url(url)}", debug)
         return ("", status)
 
-    log_err(f"Shodan API rate limit exceeded: {redact_url(url)}", debug)
+    log_dbg(f"Shodan API rate limit exceeded: {redact_url(url)}", debug)
     return ("", 429)
 
 
@@ -185,6 +196,19 @@ def check_live(host: str, timeout: int) -> tuple:
     if not host:
         return ("dead", "")
 
+    try:
+        result = subprocess.run(
+            ["ping", "-c", "1", host],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+        )
+        if result.returncode == 0:
+            return ("live", "icmp")
+    except Exception:
+        pass
+
     https_ctx = ssl._create_unverified_context()
     for proto, ctx in (("https", https_ctx), ("http", None)):
         url = f"{proto}://{host}"
@@ -197,13 +221,110 @@ def check_live(host: str, timeout: int) -> tuple:
     return ("dead", "")
 
 
-def print_header(deadcheck: bool) -> None:
-    if deadcheck:
+def check_registerable(host: str, debug: bool) -> str:
+    hostname = host.rstrip(".").lower()
+    suffix = ".trafficmanager.net"
+    if not hostname.endswith(suffix):
+        return ""
+    name = hostname[: -len(suffix)].strip(".")
+    if not name:
+        return ""
+    try:
+        result = subprocess.run(
+            ["az", "network", "traffic-manager", "profile", "check-dns", "--name", name],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except Exception:
+        log_dbg(f"az check-dns failed for {name}", debug)
+        return ""
+    if result.returncode != 0:
+        log_dbg(f"az check-dns error for {name}: {result.stderr.strip()}", debug)
+        return ""
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        log_dbg(f"az check-dns returned invalid JSON for {name}", debug)
+        return ""
+    available = payload.get("nameAvailable")
+    if available is True:
+        return "yes"
+    if available is False:
+        return "no"
+    return ""
+
+
+def print_header(deadcheck: bool, onlydead: bool) -> None:
+    if deadcheck and onlydead:
+        print(
+            f"{'DOMAIN':<30} {'SUBDOMAIN':<45} {'VALUE':<45} {'LIVE':<6} PROTO REGISTERABLE"
+        )
+        print(
+            f"{'------':<30} {'---------':<45} {'-----':<45} {'----':<6} ----- ------------"
+        )
+    elif deadcheck:
         print(f"{'DOMAIN':<30} {'SUBDOMAIN':<45} {'VALUE':<45} {'LIVE':<6} PROTO")
         print(f"{'------':<30} {'---------':<45} {'-----':<45} {'----':<6} -----")
     else:
         print(f"{'DOMAIN':<30} {'SUBDOMAIN':<45} VALUE")
         print(f"{'------':<30} {'---------':<45} -----")
+
+
+def init_output_writer(args):
+    if not args.out_file or args.out_format not in ("json", "csv"):
+        return (None, None)
+    if args.out_format == "csv":
+        handle = open(args.out_file, "w", encoding="utf-8", newline="")
+        writer = csv.writer(handle)
+        if args.deadcheck and args.onlydead:
+            writer.writerow(["domain", "subdomain", "value", "live", "proto", "registerable"])
+        elif args.deadcheck:
+            writer.writerow(["domain", "subdomain", "value", "live", "proto"])
+        else:
+            writer.writerow(["domain", "subdomain", "value"])
+        handle.flush()
+
+        def emit(item):
+            if args.deadcheck and args.onlydead:
+                writer.writerow(
+                    [
+                        item["domain"],
+                        item["subdomain"],
+                        item["value"],
+                        item["live"],
+                        item["proto"],
+                        item["registerable"],
+                    ]
+                )
+            elif args.deadcheck:
+                writer.writerow(
+                    [item["domain"], item["subdomain"], item["value"], item["live"], item["proto"]]
+                )
+            else:
+                writer.writerow([item["domain"], item["subdomain"], item["value"]])
+            handle.flush()
+
+        return (handle, emit)
+
+    handle = open(args.out_file, "w", encoding="utf-8")
+    close_str = "\n]\n"
+    handle.write("[\n]\n")
+    handle.flush()
+    state = {"first": True, "pos": len("[\n")}
+
+    def emit(item):
+        payload = json.dumps(item, separators=(",", ":"))
+        handle.seek(state["pos"])
+        prefix = "" if state["first"] else ",\n"
+        handle.write(f"{prefix}{payload}")
+        handle.write(close_str)
+        handle.flush()
+        state["pos"] = handle.tell() - len(close_str)
+        state["first"] = False
+
+    return (handle, emit)
 
 
 def main(argv) -> int:
@@ -223,6 +344,20 @@ def main(argv) -> int:
     if not api_key:
         log_err("No Shodan API key found in SHODANAPI or ~/.shodan/api_key.", args.debug)
         return 1
+    info_body, info_status = shodan_api_info(api_key, args.debug)
+    if info_status == 401 and fallback_key:
+        log_dbg("401 with SHODANAPI; retrying api-info with ~/.shodan/api_key", args.debug)
+        info_body, info_status = shodan_api_info(fallback_key, args.debug)
+        if info_status == 200:
+            api_key = fallback_key
+    if info_status == 200 and info_body:
+        try:
+            info_data = json.loads(info_body)
+            print(json.dumps(info_data, indent=2, sort_keys=True))
+        except json.JSONDecodeError:
+            log_err("Invalid JSON from Shodan api-info.", args.debug)
+    else:
+        log_err("Unable to fetch Shodan api-info; continuing.", args.debug)
 
     if not os.path.isfile(args.input_file):
         log_err(f"Cannot read input file: {args.input_file}", args.debug)
@@ -231,137 +366,113 @@ def main(argv) -> int:
         log_err(f"Cannot read fragments file: {args.fragments_file}", args.debug)
         return 1
 
+    if args.onlydead:
+        args.deadcheck = True
+
     suffixes = load_suffixes(args.fragments_file)
     dedupe = set()
-    results = []
 
-    print_header(args.deadcheck)
+    print_header(args.deadcheck, args.onlydead)
+
+    out_handle, emit_output = init_output_writer(args)
 
     queried = set()
-    for domain in read_lines(args.input_file):
-        raw_domain = domain
-        domain = normalize_domain(domain)
-        if not domain:
-            continue
-        core = core_domain(domain)
-        if core in queried:
-            log_dbg(f"Skipping duplicate core domain: {core} (input: {raw_domain})", args.debug)
-            continue
-        queried.add(core)
-        if core != domain:
-            log_dbg(f"Using core domain {core} for input {domain}", args.debug)
-        log_dbg(f"Processing domain: {core}", args.debug)
-        url = (
-            "https://api.shodan.io/dns/domain/"
-            f"{core}?key={api_key}&type=CNAME&page=1&history=false"
-        )
-        body, status = shodan_get(url, args.debug)
-        if status == 401 and fallback_key:
-            log_dbg("401 with SHODANAPI; retrying with ~/.shodan/api_key", args.debug)
+    try:
+        for domain in read_lines(args.input_file):
+            raw_domain = domain
+            domain = normalize_domain(domain)
+            if not domain:
+                continue
+            core = core_domain(domain)
+            if core in queried:
+                log_dbg(f"Skipping duplicate core domain: {core} (input: {raw_domain})", args.debug)
+                continue
+            queried.add(core)
+            if core != domain:
+                log_dbg(f"Using core domain {core} for input {domain}", args.debug)
+            log_dbg(f"Processing domain: {core}", args.debug)
             url = (
                 "https://api.shodan.io/dns/domain/"
-                f"{core}?key={fallback_key}&type=CNAME&page=1&history=false"
+                f"{core}?key={api_key}&type=CNAME&page=1&history=false"
             )
             body, status = shodan_get(url, args.debug)
-        if not body:
-            if status == 401:
-                log_err(f"Shodan API unauthorized; check API key. Skipping domain: {core}", args.debug)
-            else:
-                log_err(f"Skipping domain (unresolved): {core}", args.debug)
-            continue
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError:
-            log_err(f"Invalid JSON from Shodan for domain: {core}", args.debug)
-            continue
+            if status == 401 and fallback_key:
+                log_dbg("401 with SHODANAPI; retrying with ~/.shodan/api_key", args.debug)
+                url = (
+                    "https://api.shodan.io/dns/domain/"
+                    f"{core}?key={fallback_key}&type=CNAME&page=1&history=false"
+                )
+                body, status = shodan_get(url, args.debug)
+            if not body:
+                if status == 401:
+                    log_dbg(
+                        f"Shodan API unauthorized; check API key. Skipping domain: {core}",
+                        args.debug,
+                    )
+                else:
+                    log_dbg(f"Skipping domain (unresolved): {core}", args.debug)
+                continue
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                log_err(f"Invalid JSON from Shodan for domain: {core}", args.debug)
+                continue
 
-        records = data.get("data", [])
-        seen = 0
-        for entry in records:
-            if seen >= 100:
-                log_dbg(f"CNAME cap reached for {core}; skipping remaining records", args.debug)
-                break
-            rec_type = entry.get("type")
-            if rec_type != "CNAME":
-                continue
-            sub = entry.get("subdomain") or ""
-            value = entry.get("value") or ""
-            fqdn = f"{sub}.{core}" if sub else core
+            records = data.get("data", [])
+            seen = 0
+            for entry in records:
+                if seen >= 100:
+                    log_dbg(f"CNAME cap reached for {core}; skipping remaining records", args.debug)
+                    break
+                rec_type = entry.get("type")
+                if rec_type != "CNAME":
+                    continue
+                sub = entry.get("subdomain") or ""
+                value = entry.get("value") or ""
+                fqdn = f"{sub}.{core}" if sub else core
 
-            seen += 1
-            log_dbg(f"CNAME {fqdn} -> {value}", args.debug)
-            if not is_suffix_match(value, suffixes):
-                log_dbg(f"No suffix match for {fqdn} -> {value}", args.debug)
-                continue
-            log_dbg(f"Matched suffix for {fqdn} -> {value}", args.debug)
-            key = f"{core}|{fqdn}|{value}"
-            if key in dedupe:
-                continue
-            dedupe.add(key)
-            live_state, live_proto = ("", "")
-            if args.deadcheck:
-                live_state, live_proto = check_live(value, 10)
-            results.append(
-                {
+                seen += 1
+                log_dbg(f"CNAME {fqdn} -> {value}", args.debug)
+                if not is_suffix_match(value, suffixes):
+                    log_dbg(f"No suffix match for {fqdn} -> {value}", args.debug)
+                    continue
+                log_dbg(f"Matched suffix for {fqdn} -> {value}", args.debug)
+                key = f"{core}|{fqdn}|{value}"
+                if key in dedupe:
+                    continue
+                dedupe.add(key)
+                live_state, live_proto = ("", "")
+                registerable = ""
+                if args.deadcheck:
+                    live_state, live_proto = check_live(value, 10)
+                    if args.onlydead and live_state == "dead":
+                        registerable = check_registerable(value, args.debug)
+                if args.onlydead and live_state != "dead":
+                    continue
+                item = {
                     "domain": core,
                     "subdomain": fqdn,
                     "value": value,
                     "live": live_state,
                     "proto": live_proto,
+                    "registerable": registerable,
                 }
-            )
-            if args.deadcheck:
-                print(
-                    f"{domain:<30} {fqdn:<45} {value:<45} {live_state:<6} {live_proto}"
-                )
-            else:
-                print(f"{domain:<30} {fqdn:<45} {value}")
-
-    if args.out_file and args.out_format in ("json", "csv"):
-        if args.out_format == "json":
-            payload = []
-            for item in results:
-                if args.deadcheck:
-                    payload.append(
-                        {
-                            "domain": item["domain"],
-                            "subdomain": item["subdomain"],
-                            "value": item["value"],
-                            "live": item["live"],
-                            "proto": item["proto"],
-                        }
+                if emit_output:
+                    emit_output(item)
+                if args.deadcheck and args.onlydead:
+                    print(
+                        f"{domain:<30} {fqdn:<45} {value:<45} {live_state:<6} "
+                        f"{live_proto:<5} {registerable}"
+                    )
+                elif args.deadcheck:
+                    print(
+                        f"{domain:<30} {fqdn:<45} {value:<45} {live_state:<6} {live_proto}"
                     )
                 else:
-                    payload.append(
-                        {
-                            "domain": item["domain"],
-                            "subdomain": item["subdomain"],
-                            "value": item["value"],
-                        }
-                    )
-            with open(args.out_file, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, separators=(",", ":"))
-        else:
-            with open(args.out_file, "w", encoding="utf-8", newline="") as handle:
-                writer = csv.writer(handle)
-                if args.deadcheck:
-                    writer.writerow(["domain", "subdomain", "value", "live", "proto"])
-                    for item in results:
-                        writer.writerow(
-                            [
-                                item["domain"],
-                                item["subdomain"],
-                                item["value"],
-                                item["live"],
-                                item["proto"],
-                            ]
-                        )
-                else:
-                    writer.writerow(["domain", "subdomain", "value"])
-                    for item in results:
-                        writer.writerow(
-                            [item["domain"], item["subdomain"], item["value"]]
-                        )
+                    print(f"{domain:<30} {fqdn:<45} {value}")
+    finally:
+        if out_handle:
+            out_handle.close()
 
     return 0
 
