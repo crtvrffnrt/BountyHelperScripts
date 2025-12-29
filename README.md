@@ -1,71 +1,34 @@
 # BountyHelperScripts
 
-A small collection of helper scripts for bug bounty hunting, cloud reconnaissance, and exposure analysis.
-All tools are designed for authorized testing within approved scopes.
+A focused collection of Python helper tools for bug bounty hunting, cloud reconnaissance, and DNS exposure analysis.  
+All scripts are designed for authorized testing within explicitly approved scopes and prioritize high-signal findings over noisy automation.
+
+The tools rely on the Shodan DNS API to extract historical and current DNS intelligence that is often missed by live resolvers, making them particularly useful for large-scale scope analysis and takeover reconnaissance.
 
 ---
 
-## subtaker.sh
+## Included Tools
 
-subtaker.sh enumerates subdomains and DNS records using the Shodan DNS API and identifies potential subdomain takeover candidates by correlating CNAME and A records with known cloud provider suffixes such as azurewebsites.net, azurefd.net, cloudfront.net, and similar platforms.
+### subtaker.py
 
-The script focuses on reconnaissance and exposure identification. It does not perform exploitation and does not bypass cloud provider ownership controls.
+subtaker.py enumerates DNS CNAME records for scoped domains via the Shodan DNS API and correlates them against known cloud and managed service suffixes.  
+Its primary goal is to identify potential subdomain takeover candidates caused by dangling or unclaimed backend resources.
+
+The script performs reconnaissance only.  
+It does not attempt exploitation, service claiming, or provider ownership bypass.
+
+Core features:
+• Core-domain normalization and deduplication  
+• Matching against customizable suffix fragment lists  
+• Optional HTTP and HTTPS liveness checks  
+• Live table output to stdout  
+• Optional JSON or CSV export  
+• Built-in retry, backoff, and rate-limit handling  
 
 ---
-Before running the script, export your Shodan API key:
+
+#### Basic Usage
 
 ```bash
 export SHODANAPI="YOUR_SHODAN_API_KEY"
-```
-
----
-
-### Basic Usage
-
-```bash
-./subtaker.sh -i scope.txt -d target-domainfragments.txt --deadcheck
-```
-
----
-
-### Parameters
-
-### -i scope.txt
-
-File containing root domains to enumerate via the Shodan DNS API.
-
-
-### -d target-domainfragments.txt
-
-File containing domain suffix fragments to match against DNS values.
-These fragments typically represent cloud providers or managed services that are commonly involved in subdomain takeover scenarios.
-
-Example:
-
-```text
-azurewebsites.net
-azurefd.net
-cloudfront.net
-herokuapp.com
-github.io
-```
-
----
-
-### --deadcheck
-
-Enables HTTP and HTTPS reachability checks for matched targets.
-Results are classified as `live` or `dead` based on network responses.
-
-A `dead` result indicates that the backend does not respond, not that takeover is possible.
-
----
-
-### -O table | json | csv
-
-Example:
-
-```bash
-./subtaker.sh -i scope.txt -d fragments.txt -O json --output results.json --deadcheck
-```
-
+./subtaker.py -i scope.txt -d target-domainfragments.txt --deadcheck
