@@ -59,6 +59,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Only output dead endpoints and check Traffic Manager registerability.",
     )
+    parser.add_argument(
+        "-scope",
+        dest="scope",
+        choices=["trafficmanager", "storage", "websites", "frontdoor"],
+        help="Filter CNAME targets by product (trafficmanager, storage, websites, frontdoor).",
+    )
     parser.add_argument("-h", "--help", action="store_true", dest="help_flag", help="Show this help and exit.")
     return parser
 
@@ -262,6 +268,12 @@ FRONTDOOR_RG_NAME = "MSOBB"
 FRONTDOOR_API_VER = "2025-04-15"
 FRONTDOOR_TYPE = "Microsoft.Cdn/Profiles/AfdEndpoints"
 FRONTDOOR_LABEL_RE = re.compile(r"^[a-z0-9-]{1,63}$")
+SCOPE_SUFFIXES = {
+    "trafficmanager": ("trafficmanager.net",),
+    "storage": ("core.windows.net",),
+    "websites": ("azurewebsites.net",),
+    "frontdoor": FRONTDOOR_SUFFIXES,
+}
 
 
 def extract_hostname(raw: str) -> str:
@@ -528,6 +540,7 @@ def main(argv) -> int:
         args.deadcheck = True
 
     suffixes = load_suffixes(args.fragments_file)
+    scope_suffixes = SCOPE_SUFFIXES.get(args.scope) if args.scope else ()
     dedupe = set()
 
     print_header(args.deadcheck, args.onlydead)
@@ -592,6 +605,14 @@ def main(argv) -> int:
 
                 seen += 1
                 log_dbg(f"CNAME {fqdn} -> {value}", args.debug)
+                if scope_suffixes:
+                    host_for_scope = extract_hostname(value)
+                    if not is_suffix_match(host_for_scope, scope_suffixes):
+                        log_dbg(
+                            f"Scope filter miss for {fqdn} -> {value} (scope {args.scope})",
+                            args.debug,
+                        )
+                        continue
                 if not is_suffix_match(value, suffixes):
                     log_dbg(f"No suffix match for {fqdn} -> {value}", args.debug)
                     continue
