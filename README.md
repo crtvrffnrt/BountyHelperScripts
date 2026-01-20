@@ -13,9 +13,9 @@ Most DNS tools use the Shodan DNS API for historical data that normal resolvers 
 
 ## Tools
 
-### subtaker.py
+### subtaker.py 
 Find CNAMEs via Shodan DNS and match them against known provider suffix fragments to flag potential takeover candidates.
-
+Free Shodan api key is limited in api requests. i recommend using freelancer Subscription to use this script on big domain lists. 
 ```bash
 export SHODANAPI="YOUR_SHODAN_API_KEY"
 ./subtaker.py -i scope.txt -d az-domainfragments.txt --deadcheck
