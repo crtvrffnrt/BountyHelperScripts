@@ -10,6 +10,7 @@ Most DNS tools use the Shodan DNS API for historical data that normal resolvers 
 - Dependencies:
   - Python scripts: `python3`
   - Azure scripts: `az` CLI logged in (`az login`)
+  - `tenant-domain-lookup.sh`: `bash`, `curl`, and `jq`
 
 ## Tools
 
@@ -72,6 +73,56 @@ options:
 Examples:
   ./txtfinder.py -i scope.txt -s "ms="
   ./txtfinder.py -i scope.txt -s "google-site-verification" --debug
+```
+
+### tenant-domain-lookup.sh
+Resolve Microsoft tenant IDs and domains using azmap.dev, Microsoft OpenID metadata, and Microsoft Graph fallback lookups.
+
+```bash
+./tenant-domain-lookup.sh --tenant-id 72f988bf-86f1-41af-91ab-2d7cd011db47
+./tenant-domain-lookup.sh --domain example.com --output-format json
+./tenant-domain-lookup.sh --tenant-file tenants.txt --output-format text --output-file domains.txt
+```
+
+Help:
+```text
+Usage:
+  ./tenant-domain-lookup.sh --tenant-id <tenant-id>
+  ./tenant-domain-lookup.sh --domain <domain>
+  ./tenant-domain-lookup.sh --fallback-domain <fallback-domain>
+  ./tenant-domain-lookup.sh --tenant-file tenants.txt
+  ./tenant-domain-lookup.sh --domain-file domains.txt
+  ./tenant-domain-lookup.sh --fallback-domain-file fallback-domains.txt
+
+Options:
+  --tenant-id <tenant-id>                 Resolve tenant ID to related domains.
+  --tenant-file <file>                    Read tenant IDs, one per line.
+  --domain <domain>                       Resolve domain to tenant ID.
+  --domain-file <file>                    Read domains, one per line.
+  --fallback-domain <domain>              Resolve fallback/onmicrosoft-style domain.
+  --fallback-domain-file <file>           Read fallback domains, one per line.
+  --output-format text|json               Default: text.
+  --output-file <file>                    Write output to file instead of stdout.
+  --include-fallback                      Include discovered fallback/onmicrosoft domains in domain lists.
+  --include-registered-domains            For domain/fallback-domain text mode, output domains instead of only tenant IDs.
+  --timeout <seconds>                     curl timeout. Default: 20.
+  --sleep <seconds>                       Sleep between requests. Default: 0.
+  --verbose                               Progress logs to stderr.
+  --debug                                 Debug logs to stderr.
+  --help                                  Show this help.
+
+Authentication for Microsoft Graph fallback:
+  Optional. The primary related-domain lookup uses azmap.dev and does not need auth.
+  Graph fallback can use either:
+    GRAPH_TOKEN=<bearer-token>
+    AZURE_ACCESS_TOKEN=<bearer-token>
+    AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
+
+Examples:
+  ./tenant-domain-lookup.sh --tenant-id 72f988bf-86f1-41af-91ab-2d7cd011db47
+  ./tenant-domain-lookup.sh --tenant-file tenants.txt --output-format text --output-file domains.txt
+  ./tenant-domain-lookup.sh --domain example.com --output-format json
+  ./tenant-domain-lookup.sh --tenant-file tenants.txt --output-format json --output-file results.json --verbose
 ```
 
 ### azvm_dns_availability.sh
