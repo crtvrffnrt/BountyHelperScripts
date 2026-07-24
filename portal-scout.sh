@@ -10,7 +10,7 @@ INPUT_FILE=""
 QUICK=0
 VERBOSE=0
 USE_HOSTNAMES=1
-USE_NUCLEI=0
+USE_NUCLEI=1
 TOP_PORTS=1000
 NAABU_RATE=2500
 HTTP_RATE=200
@@ -39,8 +39,8 @@ Options:
   --dns-workers N  Concurrent hostname lookups (default: 16)
   --timeout N      Per-request timeout (default: 5 seconds)
   --no-hostnames   Skip hostname enrichment
-  --nuclei         Add bounded Nuclei panel confirmation (slower)
-  --no-nuclei      Disable Nuclei confirmation (the default)
+  --nuclei         Add Nuclei exposed-panel confirmation (default; slower)
+  --no-nuclei      Disable Nuclei confirmation
   -h, --help       Show this help
 
 Default terminal output is one cyclic # progress line, one blank line, then URLs.
@@ -269,18 +269,19 @@ fetch_classify() {
   rg -qi "com[.]atlassian[.]jira|atlassian-token|wp-login[.]php|content=['\"]Grafana|Jenkins-Crumb|gon[.]gitlab_url" <<< "$response" && return 0
 
   local strong=0 product=0 auth=0 network=0 generic=0
-  rg -qi 'SVPNCOOKIE|/remote/logincheck|FortiClient|sslvpn-portal|Barracuda|WatchGuard|Firebox|Sophos([ -]+(Firewall|UTM|User Portal))?|Cyberoam|SonicWall|GlobalProtect|Pulse Secure|Ivanti Connect Secure|Juniper Networks Secure Access|Citrix Gateway|NetScaler Gateway|AnyConnect|[+/]CSCOE[+/]|WebVPN|Mobile Access Portal|BIG-IP|OpenVPN Connect|Vigor Login Page|DrayTek|RouterOS|MikroTik|pfSense|OPNsense|Zyxel.*(Firewall|USG)|UniFi Network' <<< "$response" && strong=1
-  rg -qi 'Fortinet|FortiGate|Barracuda|WatchGuard|Sophos|Cyberoam|SonicWall|Palo Alto|GlobalProtect|Pulse|Ivanti|Juniper|Citrix|NetScaler|Cisco|Check Point|F5|OpenVPN|DrayTek|MikroTik|RouterOS|pfSense|OPNsense|Zyxel|Huawei|Netgear|D-Link|TP-Link|Ubiquiti|UniFi|Aruba|Meraki' <<< "$response" && product=1
+  rg -qi 'SVPNCOOKIE|/remote/logincheck|FortiClient|sslvpn-portal|Barracuda|WatchGuard|Firebox|Sophos([ -]+(Firewall|UTM|User Portal))?|Cyberoam|SonicWall|GlobalProtect|Pulse Secure|Ivanti Connect Secure|Juniper Networks Secure Access|Citrix Gateway|NetScaler Gateway|AnyConnect|[+/]CSCOE[+/]|WebVPN|Mobile Access Portal|BIG-IP|OpenVPN Connect|Vigor Login Page|DrayTek|RouterOS|MikroTik|pfSense|OPNsense|Zyxel.*(Firewall|USG)|UniFi Network|Check Point|CheckPoint|Endpoint Security VPN' <<< "$response" && strong=1
+  rg -qi 'Fortinet|FortiGate|Barracuda|WatchGuard|Sophos|Cyberoam|SonicWall|Palo Alto|GlobalProtect|Pulse|Ivanti|Juniper|Citrix|NetScaler|Cisco|Check Point|CheckPoint|F5|OpenVPN|DrayTek|MikroTik|RouterOS|pfSense|OPNsense|Zyxel|Huawei|Netgear|D-Link|TP-Link|Ubiquiti|UniFi|Aruba|Meraki' <<< "$response" && product=1
   rg -qi "type[[:space:]]*=[[:space:]]*['\"]?password|name[[:space:]]*=[[:space:]]*['\"][^'\"]*(password|passwd)|current-password|sign[ -]*in|user[ _-]*name" <<< "$response" && auth=1
   rg -qi 'SSL[- _]?VPN|VPN Portal|VPN Login|Virtual Office|Clientless Access|Remote Access|remote/login|sslvpn|webvpn|user portal|global-protect|dana-na|my[.]policy' <<< "$response" && network=1
   rg -qi '<title[^>]*>[^<]*(login|logon|sign[ -]?in|authentication|admin|router|firewall|gateway)|administration|management (console|interface|portal)' <<< "$response" && generic=1
-  ((strong || (product && (auth || network || generic)) || (network && auth))) && confidence=high
+  ((strong || (product && (auth || network || generic)))) && confidence=high
   [[ -n ${confidence:-} ]] || ((auth && generic)) && confidence=uncertain
   [[ -n ${confidence:-} ]] || return 0
   [[ $code == 404 && $strong == 0 ]] && return 0
 
   origin=$(url_origin "$current")
-  if rg -qi 'SVPNCOOKIE|/remote/logincheck|FortiClient|sslvpn-portal' <<< "$response"; then vendor=fortinet; current="$origin/remote/login?lang=en"
+  if rg -qi 'SVPNCOOKIE|/remote/logincheck|FortiClient|sslvpn-portal|Fortinet|FortiGate' <<< "$response"; then vendor=fortinet; current="$origin/remote/login?lang=en"
+  elif rg -qi 'Check Point|CheckPoint|Endpoint Security VPN|Mobile Access Portal' <<< "$response"; then vendor=checkpoint; current="$origin/sslvpn/Login/Login"
   elif rg -qi 'Barracuda' <<< "$response"; then vendor=barracuda; current="$origin/portal/index.html"
   elif rg -qi 'Vigor Login Page|DrayTek' <<< "$response"; then vendor=draytek; current="$origin/weblogin.htm"
   fi
@@ -305,17 +306,32 @@ CANDIDATES=$(
   } | xargs -0 -r -P "$HTTP_WORKERS" -n 2 bash -c 'fetch_classify "$1" "$2"' _ 2>/dev/null || true
 )
 
-if ((USE_NUCLEI)) && ((${#ALL_BASES[@]})); then
-  detail 'Nuclei panel confirmation enabled'
-  NUCLEI_FILTER="contains(tags, 'panel') && (contains(tags, 'vpn') || contains(tags, 'firewall') || contains(name, 'Router') || contains(name, 'Gateway'))"
-  NUCLEI_RESULTS=$(printf '%s\n' "${ALL_BASES[@]}" | nuclei -template-condition "$NUCLEI_FILTER" -severity info \
-    -rate-limit "$HTTP_RATE" -concurrency 20 -bulk-size 20 -timeout "$HTTP_TIMEOUT" -retries 0 \
-    -jsonl -silent -no-color -disable-update-check 2>/dev/null |
+if ((USE_NUCLEI)); then
+  detail 'Nuclei exposed-panels confirmation enabled'
+  PANEL_PORTS='80,443,4443,8000,8080,8443,9443,10443,12443,20443'
+  PANEL_TARGETS=$(printf '%s\n' "${IPS[@]}" | naabu -silent -Pn -rate 3000 -p "$PANEL_PORTS" 2>/dev/null || true)
+  NUCLEI_RESULTS=$(printf '%s\n' "$PANEL_TARGETS" | httpx -silent -nf -timeout 8 -retries 1 2>/dev/null |
+    timeout 120s nuclei -silent -t "$HOME/nuclei-templates/http/exposed-panels/" -jsonl -no-color 2>/dev/null |
     jq -r 'select(. != null) | "high\t" + (.["matched-at"] // .matched_at // .url // .host // empty)' 2>/dev/null || true)
   CANDIDATES+=$'\n'"$NUCLEI_RESULTS"
 fi
 
-RESULTS=$(printf '%s\n' "$CANDIDATES" | awk -F '\t' '$1~/^(high|uncertain)$/ && $2~/^https?:\/\// {rank=($1=="high"?2:1); if(rank>r[$2])r[$2]=rank} END{for(u in r) print r[u]"\t"u}' | sort -t $'\t' -k2,2)
+# Keep one best login URL per scheme/host. Path and port probes remain broad,
+# but one appliance must not produce one result for every matching asset path.
+RESULTS=$(printf '%s\n' "$CANDIDATES" | awk -F '\t' '
+  function authority(u, x,a,h) {
+    split(u,x,"://"); split(x[2],a,"/"); h=a[1]
+    if (h ~ /^\[/) { sub(/\]:[0-9]+$/, "]", h); return h }
+    sub(/:[0-9]+$/, "", h); return h
+  }
+  $1~/^(high|uncertain)$/ && $2~/^https?:\/\// {
+    key=authority($2); rank=($1=="high"?2:1)
+    if ($2 ~ /\/sslvpn\/Login\/Login|\/remote\/login/i) rank+=3
+    else if ($2 ~ /\/(login|logon|portal|userportal)/i) rank+=2
+    if (!(key in best) || rank>score[key]) { best[key]=$2; score[key]=rank }
+  }
+  END { for(k in best) print score[k]"\t"best[k] }
+' | sort -t $'\t' -k2,2)
 COUNT=$(printf '%s\n' "$RESULTS" | sed '/^$/d' | wc -l)
 detail "complete: $COUNT unique portal URL(s)"
 indicator_stop
