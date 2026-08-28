@@ -15,20 +15,19 @@ Most DNS tools use the Shodan DNS API for historical data that normal resolvers 
 
 ### azkeyvaultenumerator.sh
 
-Enumerate Key Vault paths visible through the current Azure CLI session. By
-default, ARM and Key Vault data-plane requests both use that session. Supply a
-separate Key Vault data-plane token when the CLI identity can enumerate a vault
-but another authorized identity has secret permissions:
+Enumerate Key Vault paths visible through the current Azure CLI session or use
+a supplied Key Vault data-plane token for secret/key operations:
 
 ```bash
 ./azkeyvaultenumerator.sh
 ./azkeyvaultenumerator.sh --token '<access-token-for-https://vault.azure.net>'
+./azkeyvaultenumerator.sh --token '<access-token-for-https://vault.azure.net>' --vault vmlab1-kvd47057e1cf
 ```
 
-`--token` is used only for Key Vault data-plane requests; ARM vault discovery
-continues to use the Azure CLI session. The token must have the
-`https://vault.azure.net` audience. An ARM token for
-`https://management.azure.com/` cannot retrieve Key Vault secret values.
+`--token` is sent only to Key Vault because Azure access tokens are
+audience-bound. ARM and Graph discovery still use the current Azure CLI login.
+Add one or more `--vault <name-or-url>` arguments to skip ARM/Graph discovery;
+that direct-vault mode needs no Azure CLI login.
 
 ### subtaker.py
 Find CNAMEs via Shodan DNS and match them against known provider suffix fragments to flag potential takeover candidates.

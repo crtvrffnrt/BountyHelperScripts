@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Harvest Azure Key Vault lab paths available to the current Azure CLI identity.
-# ARM discovery uses the Azure CLI session.  --token can supply a separate
-# Key Vault *data-plane* bearer token for secret/key operations.
+# Harvest Azure Key Vault lab paths available to an Azure CLI identity. A
+# caller-supplied Key Vault bearer token can replace the CLI identity only for
+# data-plane requests; ARM and Graph require tokens with different audiences.
 
 set -uo pipefail
 
@@ -19,17 +19,21 @@ change() { printf '[change] %s\n' "$*" >&2; }
 
 usage() {
     cat <<'EOF'
-Usage: azkeyvaultenumerator.sh [--token <key-vault-bearer-token>]
+Usage: azkeyvaultenumerator.sh [--token <key-vault-bearer-token>] [--vault <name-or-url> ...]
 
 Without --token, all requests use the current Azure CLI session.
-With --token, Azure Resource Manager discovery still uses the current Azure
-CLI session, while Key Vault data-plane requests use the supplied bearer token.
-The token must be issued for https://vault.azure.net (not
-https://management.azure.com/). It is never printed or written to disk.
+With --token, Key Vault data-plane requests use the supplied bearer token;
+ARM and Graph discovery continue to use the current Azure CLI session.
+
+Supply --vault one or more times to skip ARM/Graph discovery. In that mode,
+--token is required and an Azure CLI login is not needed. A vault may be a
+short name or an https://<name>.vault.azure.net URL. The token is never printed
+or written to disk.
 EOF
 }
 
 KV_BEARER_TOKEN=''
+DIRECT_VAULTS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --token)
@@ -42,6 +46,17 @@ while [[ $# -gt 0 ]]; do
             [[ -n "$KV_BEARER_TOKEN" ]] || die '--token requires a bearer token value'
             shift
             ;;
+        --vault)
+            [[ $# -ge 2 && -n "${2:-}" ]] || die '--vault requires a vault name or URL'
+            DIRECT_VAULTS+=("$2")
+            shift 2
+            ;;
+        --vault=*)
+            direct_vault="${1#*=}"
+            [[ -n "$direct_vault" ]] || die '--vault requires a vault name or URL'
+            DIRECT_VAULTS+=("$direct_vault")
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -50,14 +65,19 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Permit callers to paste either the raw JWT or a conventional Bearer value.
+# Accept a conventional Authorization header value without changing a raw JWT.
 KV_BEARER_TOKEN="${KV_BEARER_TOKEN#Bearer }"
 KV_BEARER_TOKEN="${KV_BEARER_TOKEN#bearer }"
 
-for required in az jq base64; do
+for required in jq base64; do
     command -v "$required" >/dev/null 2>&1 || die "$required is required"
 done
 [[ -z "$KV_BEARER_TOKEN" ]] || command -v curl >/dev/null 2>&1 || die 'curl is required with --token'
+if ((${#DIRECT_VAULTS[@]})); then
+    [[ -n "$KV_BEARER_TOKEN" ]] || die '--vault requires --token'
+else
+    command -v az >/dev/null 2>&1 || die 'az is required unless --vault and --token are supplied'
+fi
 
 TASK_TMP="$(mktemp -d)" || die 'could not create a temporary directory'
 cleanup() {
@@ -78,8 +98,8 @@ mkdir -p "$TASK_TMP/active"
 
 rest_call() {
     local method="$1" url="$2" resource="${3:-}" body="${4:-}"
-    # az rest's --resource requests a CLI token.  Use curl for Key Vault when a
-    # caller deliberately supplies a separate data-plane token; never print it.
+    # Bearer tokens are audience-bound. Never send a Key Vault token to ARM or
+    # Graph, and never print or persist it.
     if [[ -n "$KV_BEARER_TOKEN" && "$resource" == "$KV_RESOURCE" ]]; then
         local curl_args=(curl --silent --show-error --fail-with-body --request "$method" \
             --header "Authorization: Bearer ${KV_BEARER_TOKEN}" \
@@ -286,15 +306,35 @@ validate_kv_bearer_token() {
     jq -e . >/dev/null 2>&1 <<<"$claims" || die '--token has an invalid JWT payload'
     audience="$(jq -r '.aud // empty' <<<"$claims")"
     case "$audience" in
-        https://vault.azure.net|https://vault.azure.net/) ;;
+        https://vault.azure.net|https://vault.azure.net/|cfa8b339-82a2-471a-a3c9-0fc0be7a4093) ;;
         https://management.azure.com|https://management.azure.com/)
-            die '--token is an Azure Resource Manager token; obtain a Key Vault data-plane token for https://vault.azure.net'
+            die '--token is an Azure Resource Manager token; obtain a Key Vault token for https://vault.azure.net'
             ;;
-        *) die "--token audience is ${audience:-missing}; expected https://vault.azure.net" ;;
+        *) die "--token audience is ${audience:-missing}; expected the Azure Key Vault audience" ;;
     esac
     expires_at="$(jq -r '.exp // empty' <<<"$claims")"
     now="$(date +%s)"
     [[ "$expires_at" =~ ^[0-9]+$ && "$expires_at" -gt "$now" ]] || die '--token is expired or has no usable exp claim'
+}
+
+build_direct_vaults() {
+    local supplied uri host name vaults='[]'
+    for supplied in "${DIRECT_VAULTS[@]}"; do
+        if [[ "$supplied" == https://* ]]; then
+            uri="${supplied%/}/"
+            host="${uri#https://}"
+            host="${host%%/*}"
+            [[ "$host" == *.vault.azure.net ]] || die "unsupported Key Vault URL: $supplied"
+            name="${host%%.vault.azure.net}"
+        else
+            [[ "$supplied" =~ ^[A-Za-z0-9-]+$ ]] || die "invalid Key Vault name: $supplied"
+            name="$supplied"
+            uri="https://${name}.vault.azure.net/"
+        fi
+        vaults="$(jq -cn --argjson current "$vaults" --arg name "$name" --arg uri "$uri" \
+            '$current + [{name:$name,properties:{vaultUri:$uri,enableRbacAuthorization:true}}]')"
+    done
+    printf '%s\n' "$vaults"
 }
 
 decrypt_lab_ciphertext() {
@@ -337,27 +377,38 @@ print_table() {
         if command -v column >/dev/null 2>&1; then column -t -s $'\t'; else cat; fi
 }
 
-CONTEXT="$(az account show --query '{subscription:id,tenant:tenantId,principal:user.name,principalType:user.type}' -o json 2>/dev/null)" || die 'no active Azure CLI login; authenticate first'
 validate_kv_bearer_token
+if ((${#DIRECT_VAULTS[@]})); then
+    token_claims="$(base64url_decode "$(cut -d. -f2 <<<"$KV_BEARER_TOKEN")")"
+    CONTEXT="$(jq -cn --arg tenant "$(jq -r '.tid // "unknown"' <<<"$token_claims")" \
+        --arg principal "$(jq -r '.appid // .oid // "unknown"' <<<"$token_claims")" \
+        '{subscription:"direct-vault",tenant:$tenant,principal:$principal,principalType:"managedIdentity"}')"
+else
+    CONTEXT="$(az account show --query '{subscription:id,tenant:tenantId,principal:user.name,principalType:user.type}' -o json 2>/dev/null)" || die 'no active Azure CLI login; authenticate first'
+fi
 SUBSCRIPTION_ID="$(jq -r '.subscription' <<<"$CONTEXT")"
 TENANT_ID="$(jq -r '.tenant' <<<"$CONTEXT")"
 PRINCIPAL_NAME="$(jq -r '.principal' <<<"$CONTEXT")"
 PRINCIPAL_TYPE="$(jq -r '.principalType' <<<"$CONTEXT")"
 [[ -n "$SUBSCRIPTION_ID" && "$SUBSCRIPTION_ID" != null ]] || die 'the current login has no active subscription'
-OBJECT_ID="$(resolve_object_id "$PRINCIPAL_TYPE" "$PRINCIPAL_NAME")"
+if ((${#DIRECT_VAULTS[@]})); then OBJECT_ID=''; else OBJECT_ID="$(resolve_object_id "$PRINCIPAL_TYPE" "$PRINCIPAL_NAME")"; fi
 info "subscription=${SUBSCRIPTION_ID} tenant=${TENANT_ID} identity=${PRINCIPAL_TYPE}:${PRINCIPAL_NAME} objectId=${OBJECT_ID:-unresolved}"
 
-RESOURCE_URL="https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resources?api-version=${ARM_API}"
-RESOURCES="$(collect_pages "$RESOURCE_URL" "$ARM_RESOURCE")" || die 'could not enumerate subscription resources through ARM'
-VAULT_REFS="$(jq -c '[.[] | select((.type | ascii_downcase) == "microsoft.keyvault/vaults")]' <<<"$RESOURCES")"
-VAULT_DETAILS="$TASK_TMP/vaults.ndjson"
-: >"$VAULT_DETAILS"
-while IFS= read -r vault_ref; do
-    vault_id="$(jq -r '.id' <<<"$vault_ref")"
-    vault_detail="$(rest_call get "https://management.azure.com${vault_id}?api-version=${VAULT_ARM_API}" "$ARM_RESOURCE")" || continue
-    printf '%s\n' "$vault_detail" >>"$VAULT_DETAILS"
-done < <(jq -c '.[]' <<<"$VAULT_REFS")
-VAULTS="$(jq -sc 'sort_by(.name)' "$VAULT_DETAILS")"
+if ((${#DIRECT_VAULTS[@]})); then
+    VAULTS="$(build_direct_vaults)"
+else
+    RESOURCE_URL="https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resources?api-version=${ARM_API}"
+    RESOURCES="$(collect_pages "$RESOURCE_URL" "$ARM_RESOURCE")" || die 'could not enumerate subscription resources through ARM'
+    VAULT_REFS="$(jq -c '[.[] | select((.type | ascii_downcase) == "microsoft.keyvault/vaults")]' <<<"$RESOURCES")"
+    VAULT_DETAILS="$TASK_TMP/vaults.ndjson"
+    : >"$VAULT_DETAILS"
+    while IFS= read -r vault_ref; do
+        vault_id="$(jq -r '.id' <<<"$vault_ref")"
+        vault_detail="$(rest_call get "https://management.azure.com${vault_id}?api-version=${VAULT_ARM_API}" "$ARM_RESOURCE")" || continue
+        printf '%s\n' "$vault_detail" >>"$VAULT_DETAILS"
+    done < <(jq -c '.[]' <<<"$VAULT_REFS")
+    VAULTS="$(jq -sc 'sort_by(.name)' "$VAULT_DETAILS")"
+fi
 [[ "$(jq 'length' <<<"$VAULTS")" -gt 0 ]] || die 'no Key Vault resources were visible to the current identity'
 info "discovered $(jq 'length' <<<"$VAULTS") vault(s)"
 
