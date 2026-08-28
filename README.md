@@ -1,7 +1,6 @@
 # BountyHelperScripts
 
-Small helper scripts for bug bounty recon and Azure/DNS workflows. Use only on explicitly authorized scopes.
-
+Small helper scripts for Pentest workflows. 
 Most DNS tools use the Shodan DNS API for historical data that normal resolvers miss.
 
 ## Setup
