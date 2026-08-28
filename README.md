@@ -14,7 +14,24 @@ Most DNS tools use the Shodan DNS API for historical data that normal resolvers 
 
 ## Tools
 
-### subtaker.py 
+### azkeyvaultenumerator.sh
+
+Enumerate Key Vault paths visible through the current Azure CLI session. By
+default, ARM and Key Vault data-plane requests both use that session. Supply a
+separate Key Vault data-plane token when the CLI identity can enumerate a vault
+but another authorized identity has secret permissions:
+
+```bash
+./azkeyvaultenumerator.sh
+./azkeyvaultenumerator.sh --token '<access-token-for-https://vault.azure.net>'
+```
+
+`--token` is used only for Key Vault data-plane requests; ARM vault discovery
+continues to use the Azure CLI session. The token must have the
+`https://vault.azure.net` audience. An ARM token for
+`https://management.azure.com/` cannot retrieve Key Vault secret values.
+
+### subtaker.py
 Find CNAMEs via Shodan DNS and match them against known provider suffix fragments to flag potential takeover candidates.
 Free Shodan api key is limited in api requests. i recommend using freelancer Subscription to use this script on big domain lists. 
 ```bash
@@ -274,3 +291,71 @@ Notes:
   - Auto-generated resource groups end with: -<unix-timestamp>-frontdoorcreator
   - Origin host should be publicly reachable for a healthy endpoint.
 ```
+
+### portal-scout.sh
+
+Scan an authorized IPv4 list for publicly reachable VPN, firewall, router, and
+other appliance-management portals. It uses bounded per-IP jobs and emits
+candidate portal URLs.
+
+```bash
+./portal-scout.sh targets.txt
+./portal-scout.sh --nuclei --timeout 8 targets.txt
+```
+
+Requires `naabu`, `httpx`, `curl`, `openssl`, `dig`, `jq`, `rg`, and related
+standard command-line utilities. `--nuclei` additionally requires Nuclei and
+its exposed-panel templates.
+
+### azvmmetadataenum.sh
+
+Read Azure Instance Metadata Service (IMDS) information from inside an Azure
+VM. Requests are GET-only and bypass proxy settings. A normal run requests and
+prints managed-identity tokens for Azure Resource Manager, Microsoft Graph, Key
+Vault, and Azure Storage.
+
+```bash
+./azvmmetadataenum.sh
+./azvmmetadataenum.sh --client-id UUID --output-dir ./imds-evidence
+./azvmmetadataenum.sh --identity-resource https://database.windows.net/
+```
+
+Token output is sensitive. Redirect or protect terminal output appropriately;
+the optional evidence directory stores redacted token responses and claims only.
+
+### username-variants.sh
+
+Interactively generate common username variants from a person’s name. Prompts
+are sent to stderr, so generated candidates can be redirected safely.
+
+```bash
+./username-variants.sh > usernames.txt
+```
+
+The script asks for first name, optional middle name, last name, and an optional
+additional surname.
+
+### trafficmanager.sh
+
+Create Azure Traffic Manager profiles, individually or from a list of desired
+Traffic Manager hostnames. Requires an authenticated Azure CLI session and may
+create a resource group when `--location` is supplied.
+
+```bash
+./trafficmanager.sh --name tm-demo --resource-group rg-demo --dns-name demo-tm
+./trafficmanager.sh --targets targets.txt --resource-group rg-demo --location westeurope
+```
+
+### searchhostname.sh
+
+Resolve one or more IPv4 addresses to hostnames using reverse DNS and optional
+passive data providers. API-backed enrichment is enabled only when its relevant
+environment variables are available.
+
+```bash
+./searchhostname.sh -ip 203.0.113.10
+./searchhostname.sh -ips ips.txt
+```
+
+Supported optional credentials include `SHODAN_API_KEY`, `vtapi`,
+`securitytrailsapi`, `ipinfoapi`, `riskiquser`, and `riskiqkey`.

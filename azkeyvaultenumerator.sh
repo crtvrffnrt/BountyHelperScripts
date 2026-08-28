@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Harvest Azure Key Vault lab paths available to the current Azure CLI identity.
-# No arguments are required. State changes are logged to stderr; the table is stdout.
+# ARM discovery uses the Azure CLI session.  --token can supply a separate
+# Key Vault *data-plane* bearer token for secret/key operations.
 
 set -uo pipefail
 
@@ -16,10 +17,47 @@ die() { printf '[!] %s\n' "$*" >&2; exit 1; }
 info() { printf '[*] %s\n' "$*" >&2; }
 change() { printf '[change] %s\n' "$*" >&2; }
 
-[[ $# -eq 0 ]] || die 'this script uses the current az CLI session and accepts no arguments'
+usage() {
+    cat <<'EOF'
+Usage: azkeyvaultenumerator.sh [--token <key-vault-bearer-token>]
+
+Without --token, all requests use the current Azure CLI session.
+With --token, Azure Resource Manager discovery still uses the current Azure
+CLI session, while Key Vault data-plane requests use the supplied bearer token.
+The token must be issued for https://vault.azure.net (not
+https://management.azure.com/). It is never printed or written to disk.
+EOF
+}
+
+KV_BEARER_TOKEN=''
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --token)
+            [[ $# -ge 2 && -n "${2:-}" ]] || die '--token requires a bearer token value'
+            KV_BEARER_TOKEN="$2"
+            shift 2
+            ;;
+        --token=*)
+            KV_BEARER_TOKEN="${1#*=}"
+            [[ -n "$KV_BEARER_TOKEN" ]] || die '--token requires a bearer token value'
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *) die "unknown argument: $1 (use --help)" ;;
+    esac
+done
+
+# Permit callers to paste either the raw JWT or a conventional Bearer value.
+KV_BEARER_TOKEN="${KV_BEARER_TOKEN#Bearer }"
+KV_BEARER_TOKEN="${KV_BEARER_TOKEN#bearer }"
+
 for required in az jq base64; do
     command -v "$required" >/dev/null 2>&1 || die "$required is required"
 done
+[[ -z "$KV_BEARER_TOKEN" ]] || command -v curl >/dev/null 2>&1 || die 'curl is required with --token'
 
 TASK_TMP="$(mktemp -d)" || die 'could not create a temporary directory'
 cleanup() {
@@ -40,6 +78,16 @@ mkdir -p "$TASK_TMP/active"
 
 rest_call() {
     local method="$1" url="$2" resource="${3:-}" body="${4:-}"
+    # az rest's --resource requests a CLI token.  Use curl for Key Vault when a
+    # caller deliberately supplies a separate data-plane token; never print it.
+    if [[ -n "$KV_BEARER_TOKEN" && "$resource" == "$KV_RESOURCE" ]]; then
+        local curl_args=(curl --silent --show-error --fail-with-body --request "$method" \
+            --header "Authorization: Bearer ${KV_BEARER_TOKEN}" \
+            --header 'Accept: application/json' --url "$url")
+        [[ -z "$body" ]] || curl_args+=(--header 'Content-Type: application/json' --data "$body")
+        "${curl_args[@]}"
+        return
+    fi
     local args=(az rest --only-show-errors --method "$method" --url "$url" -o json)
     [[ -z "$resource" ]] || args+=(--resource "$resource")
     [[ -z "$body" ]] || args+=(--body "$body")
@@ -229,6 +277,26 @@ base64url_decode() {
     printf '%s%s' "$value" "$padding" | base64 --decode 2>/dev/null
 }
 
+validate_kv_bearer_token() {
+    local header payload signature claims audience expires_at now
+    [[ -n "$KV_BEARER_TOKEN" ]] || return 0
+    IFS='.' read -r header payload signature <<<"$KV_BEARER_TOKEN"
+    [[ -n "$header" && -n "$payload" && -n "$signature" ]] || die '--token must be a JWT access token issued for Key Vault'
+    claims="$(base64url_decode "$payload")" || die '--token has an unreadable JWT payload'
+    jq -e . >/dev/null 2>&1 <<<"$claims" || die '--token has an invalid JWT payload'
+    audience="$(jq -r '.aud // empty' <<<"$claims")"
+    case "$audience" in
+        https://vault.azure.net|https://vault.azure.net/) ;;
+        https://management.azure.com|https://management.azure.com/)
+            die '--token is an Azure Resource Manager token; obtain a Key Vault data-plane token for https://vault.azure.net'
+            ;;
+        *) die "--token audience is ${audience:-missing}; expected https://vault.azure.net" ;;
+    esac
+    expires_at="$(jq -r '.exp // empty' <<<"$claims")"
+    now="$(date +%s)"
+    [[ "$expires_at" =~ ^[0-9]+$ && "$expires_at" -gt "$now" ]] || die '--token is expired or has no usable exp claim'
+}
+
 decrypt_lab_ciphertext() {
     local vault_json="$1" vault_name vault_uri keys key_item key_name encoded versions version_item key_id
     local algorithm body response plaintext ciphertext_url
@@ -270,6 +338,7 @@ print_table() {
 }
 
 CONTEXT="$(az account show --query '{subscription:id,tenant:tenantId,principal:user.name,principalType:user.type}' -o json 2>/dev/null)" || die 'no active Azure CLI login; authenticate first'
+validate_kv_bearer_token
 SUBSCRIPTION_ID="$(jq -r '.subscription' <<<"$CONTEXT")"
 TENANT_ID="$(jq -r '.tenant' <<<"$CONTEXT")"
 PRINCIPAL_NAME="$(jq -r '.principal' <<<"$CONTEXT")"

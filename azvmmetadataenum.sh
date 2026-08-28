@@ -3,8 +3,8 @@
 # Azure IMDS metadata enumerator / pentest triage helper.
 #
 # All network requests are GET requests to 169.254.169.254. The script bypasses
-# proxies, rate-limits itself, keeps access tokens out of normal output, and
-# dynamically falls back when a preferred API version is unavailable.
+# proxies, rate-limits itself, displays issued access tokens, and dynamically
+# falls back when a preferred API version is unavailable.
 #
 # Requires: bash, curl, jq, base64
 # Optional: openssl (attested document extraction), sha256sum, file
@@ -23,11 +23,16 @@ readonly ATTESTED_FALLBACK_VERSION="2025-04-07"
 TIMEOUT=5
 EVENT_TIMEOUT=10
 REQUESTED_VERSION=""
-IDENTITY_RESOURCE="https://management.azure.com/"
+IDENTITY_RESOURCES=(
+    'https://management.azure.com/'
+    'https://graph.microsoft.com/'
+    'https://vault.azure.net'
+    'https://storage.azure.com/'
+)
+EXTRA_IDENTITY_RESOURCE=""
 IDENTITY_SELECTOR_NAME=""
 IDENTITY_SELECTOR_VALUE=""
 TRY_IDENTITY=1
-SHOW_TOKEN=0
 SHOW_RAW=0
 OUTPUT_DIR=""
 USE_COLOR=1
@@ -42,12 +47,11 @@ Options:
   --api-version VERSION       Prefer this instance/attested API version.
   --timeout SECONDS           Normal request timeout (default: 5).
   --event-timeout SECONDS     Scheduled-events timeout (default: 10).
-  --identity-resource URI     Token audience to test (default: ARM).
+  --identity-resource URI     Request one additional token audience.
   --client-id ID              Select a user-assigned identity by client ID.
   --object-id ID              Select a user-assigned identity by object ID.
   --msi-res-id RESOURCE_ID    Select a user-assigned identity by ARM ID.
   --skip-identity             Do not request a managed-identity token.
-  --show-token                Print the acquired access token (sensitive).
   --raw                       Print complete raw JSON response bodies.
   --output-dir DIR            Save evidence JSON and request-index.tsv.
   --no-color                  Disable ANSI colors.
@@ -56,7 +60,8 @@ Options:
 Examples:
   ./metadataenum.sh
   ./metadataenum.sh --raw --output-dir ./imds-evidence
-  ./metadataenum.sh --client-id UUID --identity-resource https://vault.azure.net
+  ./metadataenum.sh --client-id UUID
+  ./metadataenum.sh --identity-resource https://database.windows.net/
 EOF
 }
 
@@ -90,7 +95,7 @@ while (($#)); do
             ;;
         --identity-resource)
             (($# >= 2)) || die "--identity-resource requires a value"
-            IDENTITY_RESOURCE="$2"
+            EXTRA_IDENTITY_RESOURCE="$2"
             shift 2
             ;;
         --client-id|--object-id|--msi-res-id)
@@ -106,10 +111,6 @@ while (($#)); do
             ;;
         --skip-identity)
             TRY_IDENTITY=0
-            shift
-            ;;
-        --show-token)
-            SHOW_TOKEN=1
             shift
             ;;
         --raw)
@@ -214,7 +215,7 @@ imds_get() {
 }
 
 imds_identity_get() {
-    local destination="$1" error_file="$TMP_DIR/curl-error" started
+    local resource="$1" destination="$2" error_file="$TMP_DIR/curl-error" started
     started="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
     : >"$error_file"
 
@@ -223,7 +224,7 @@ imds_identity_get() {
         --connect-timeout "$TIMEOUT" --max-time "$TIMEOUT"
         --request GET -H 'Metadata: true'
         --get --data-urlencode "api-version=$IDENTITY_VERSION"
-        --data-urlencode "resource=$IDENTITY_RESOURCE"
+        --data-urlencode "resource=$resource"
     )
     if [[ -n "$IDENTITY_SELECTOR_NAME" ]]; then
         curl_args+=(--data-urlencode "$IDENTITY_SELECTOR_NAME=$IDENTITY_SELECTOR_VALUE")
@@ -236,9 +237,9 @@ imds_identity_get() {
     LAST_CURL_STATUS=$?
     LAST_BYTES="$(wc -c <"$destination" | tr -d ' ')"
     LAST_ERROR="$(tr '\n' ' ' <"$error_file")"
-    printf '%s\tidentity\t%s\t%s\t%s\t%s\n' \
-        "$started" "${LAST_HTTP_CODE:-000}" "$LAST_CURL_STATUS" "$LAST_BYTES" \
-        "/metadata/identity/oauth2/token?api-version=$IDENTITY_VERSION&resource=$IDENTITY_RESOURCE" \
+    printf '%s\tidentity:%s\t%s\t%s\t%s\t%s\n' \
+        "$started" "$resource" "${LAST_HTTP_CODE:-000}" "$LAST_CURL_STATUS" "$LAST_BYTES" \
+        "/metadata/identity/oauth2/token?api-version=$IDENTITY_VERSION&resource=$resource" \
         >>"$REQUEST_INDEX"
     sleep 0.22
 }
@@ -601,50 +602,51 @@ fi
 
 section "12. MANAGED IDENTITY"
 
-IDENTITY_FILE="$TMP_DIR/identity.json"
-IDENTITY_REDACTED_FILE="$TMP_DIR/identity-redacted.json"
 if ((TRY_IDENTITY)); then
-    warn "Requesting a token for $IDENTITY_RESOURCE; token output is redacted by default."
-    imds_identity_get "$IDENTITY_FILE"
-    if [[ "$LAST_HTTP_CODE" == "200" ]] && jq -e '.access_token' "$IDENTITY_FILE" >/dev/null 2>&1; then
-        TOKEN="$(jq -r '.access_token' "$IDENTITY_FILE")"
-        jq '.access_token = "[REDACTED]"' "$IDENTITY_FILE" >"$IDENTITY_REDACTED_FILE"
-        high "A managed identity token was issued."
-        jq '{token_type,resource,expires_on,not_before,client_id,object_id,msi_res_id}' \
-            "$IDENTITY_FILE"
-        if command -v sha256sum >/dev/null 2>&1; then
-            value "Token SHA-256" "$(printf '%s' "$TOKEN" | sha256sum | awk '{print $1}')"
-        fi
-
-        JWT_PAYLOAD="${TOKEN#*.}"
-        JWT_PAYLOAD="${JWT_PAYLOAD%%.*}"
-        case $((${#JWT_PAYLOAD} % 4)) in
-            2) JWT_PAYLOAD="${JWT_PAYLOAD}==" ;;
-            3) JWT_PAYLOAD="${JWT_PAYLOAD}=" ;;
-        esac
-        printf '%s' "$JWT_PAYLOAD" | tr '_-' '/+' | base64 -d >"$TMP_DIR/token-claims.json" 2>/dev/null || true
-        if json_ok "$TMP_DIR/token-claims.json"; then
-            printf '%sJWT claims (access token omitted):%s\n' "$WHITE" "$RESET"
-            jq '{aud,iss,tid,oid,appid,azp,idtyp,xms_mirid,roles,scp,nbf,exp}' \
-                "$TMP_DIR/token-claims.json"
-            copy_evidence "$TMP_DIR/token-claims.json" "identity-token-claims.json"
-        fi
-        if ((SHOW_TOKEN)); then
-            printf '%s[SENSITIVE TOKEN]%s %s\n' "$RED" "$RESET" "$TOKEN"
-        else
-            info "Use --show-token only when the credential is required for an authorized next step."
-        fi
-        unset TOKEN JWT_PAYLOAD
-        copy_evidence "$IDENTITY_REDACTED_FILE" "identity-redacted.json"
-    else
-        value "Identity HTTP status" "${LAST_HTTP_CODE:-000}"
-        if json_ok "$IDENTITY_FILE"; then
-            jq . "$IDENTITY_FILE"
-        else
-            warn "Identity endpoint did not return JSON (${LAST_ERROR:-no response})."
-        fi
-        info "Identity not found may mean no identity is assigned, or the selected identity is invalid."
+    if [[ -n "$EXTRA_IDENTITY_RESOURCE" ]]; then
+        IDENTITY_RESOURCES+=("$EXTRA_IDENTITY_RESOURCE")
     fi
+    for IDENTITY_RESOURCE in "${IDENTITY_RESOURCES[@]}"; do
+        IDENTITY_LABEL="$(sed 's#^https\?://##; s#[^A-Za-z0-9._-]#-#g; s#-$##' <<<"$IDENTITY_RESOURCE")"
+        IDENTITY_FILE="$TMP_DIR/identity-${IDENTITY_LABEL}.json"
+        IDENTITY_REDACTED_FILE="$TMP_DIR/identity-${IDENTITY_LABEL}-redacted.json"
+        TOKEN_CLAIMS_FILE="$TMP_DIR/identity-${IDENTITY_LABEL}-claims.json"
+        warn "Requesting a managed-identity token for $IDENTITY_RESOURCE."
+        imds_identity_get "$IDENTITY_RESOURCE" "$IDENTITY_FILE"
+        if [[ "$LAST_HTTP_CODE" == "200" ]] && jq -e '.access_token' "$IDENTITY_FILE" >/dev/null 2>&1; then
+            TOKEN="$(jq -r '.access_token' "$IDENTITY_FILE")"
+            jq '.access_token = "[REDACTED]"' "$IDENTITY_FILE" >"$IDENTITY_REDACTED_FILE"
+            high "A managed identity token was issued for $IDENTITY_RESOURCE."
+            jq '{token_type,resource,expires_on,not_before,client_id,object_id,msi_res_id}' "$IDENTITY_FILE"
+            printf '%s[SENSITIVE TOKEN: %s]%s %s\n' "$RED" "$IDENTITY_RESOURCE" "$RESET" "$TOKEN"
+            if command -v sha256sum >/dev/null 2>&1; then
+                value "Token SHA-256" "$(printf '%s' "$TOKEN" | sha256sum | awk '{print $1}')"
+            fi
+
+            JWT_PAYLOAD="${TOKEN#*.}"
+            JWT_PAYLOAD="${JWT_PAYLOAD%%.*}"
+            case $((${#JWT_PAYLOAD} % 4)) in
+                2) JWT_PAYLOAD="${JWT_PAYLOAD}==" ;;
+                3) JWT_PAYLOAD="${JWT_PAYLOAD}=" ;;
+            esac
+            printf '%s' "$JWT_PAYLOAD" | tr '_-' '/+' | base64 -d >"$TOKEN_CLAIMS_FILE" 2>/dev/null || true
+            if json_ok "$TOKEN_CLAIMS_FILE"; then
+                printf '%sJWT claims:%s\n' "$WHITE" "$RESET"
+                jq '{aud,iss,tid,oid,appid,azp,idtyp,xms_mirid,roles,scp,nbf,exp}' "$TOKEN_CLAIMS_FILE"
+                copy_evidence "$TOKEN_CLAIMS_FILE" "identity-${IDENTITY_LABEL}-token-claims.json"
+            fi
+            unset TOKEN JWT_PAYLOAD
+            copy_evidence "$IDENTITY_REDACTED_FILE" "identity-${IDENTITY_LABEL}-redacted.json"
+        else
+            value "Identity HTTP status ($IDENTITY_RESOURCE)" "${LAST_HTTP_CODE:-000}"
+            if json_ok "$IDENTITY_FILE"; then
+                jq . "$IDENTITY_FILE"
+            else
+                warn "Identity endpoint did not return JSON (${LAST_ERROR:-no response})."
+            fi
+            info "Identity not found may mean no identity is assigned, or the selected identity is invalid."
+        fi
+    done
 else
     info "Managed-identity request skipped by operator."
 fi
