@@ -1,6 +1,6 @@
 # BountyHelperScripts
 
-Helper scripts for Pentest workflows.
+Helper -> scripts for Pentest workflows.
 Most DNS tools use the Shodan DNS API for historical data that normal resolvers miss.
 
 ## Setup
