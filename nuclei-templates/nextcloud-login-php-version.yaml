@@ -1,0 +1,40 @@
+id: nextcloud-php-version
+
+info:
+  name: Nextcloud and Advertised PHP Versions
+  author: codex
+  severity: info
+  description: Extracts the Nextcloud version from status.php and the PHP version when the same response advertises it in X-Powered-By or Server. A hidden PHP version cannot be determined remotely by this template.
+  tags: nextcloud,php,version,tech
+
+http:
+  - method: GET
+    path:
+      - "{{RootURL}}/status.php"
+      - "{{RootURL}}/nextcloud/status.php"
+    redirects: false
+    stop-at-first-match: true
+    matchers-condition: and
+    matchers:
+      - type: regex
+        part: body
+        regex:
+          - '"productname"\s*:\s*"Nextcloud"'
+      - type: regex
+        part: body
+        regex:
+          - '"version"\s*:\s*"[0-9]+(?:\.[0-9]+){3}"'
+    extractors:
+      - type: regex
+        name: nextcloud_version
+        part: body
+        group: 1
+        regex:
+          - '"version"\s*:\s*"([0-9]+(?:\.[0-9]+){3})"'
+      - type: regex
+        name: php_version
+        part: header
+        group: 1
+        regex:
+          - '(?im)^x-powered-by:\s*PHP/([0-9]+(?:\.[0-9]+){1,3})\b'
+          - '(?im)^server:[^\r\n]*\bPHP/([0-9]+(?:\.[0-9]+){1,3})\b'
